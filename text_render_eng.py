@@ -6,7 +6,7 @@ from typing import List, Tuple
 from .text_render import get_char_glyph, put_char_horizontal, add_color
 from .ballon_extractor import extract_ballon_region
 from ..utils import TextBlock, rect_distance
-
+#region_x, region_y
 WHITE = (255, 255, 255)
 BLACK = (0, 0, 0)
 PUNSET_RIGHT_ENG = {'.', '?', '!', ':', ';', ')', '}', "\""}
@@ -97,7 +97,7 @@ def seg_eng(text: str) -> List[str]:
     """
     Extracts every word from text parameter
     """
-    # TODO: replace with regexes
+    # TODO: replace with regexes m = cv2
 
     text = text.strip().upper().replace('  ', ' ').replace(' .', '.').replace('\n', ' ')
     processed_text = ''
@@ -164,12 +164,19 @@ def layout_lines_aligncenter(
     spacing: int = 0,
     delimiter: str = ' ',
     max_central_width: float = np.inf,
-    word_break: bool = False)->List[Textline]:
+    ballon_contour: np.ndarray = None,
+    word_break: bool = True)->List[Textline]:
 
-    m = cv2.moments(mask)
-    mask = 255 - mask
-    centroid_y = int(m['m01'] / m['m00'])
-    centroid_x = int(m['m10'] / m['m00'])
+    if ballon_contour is not None:
+        ys = ballon_contour[:, 0, 1]
+        xs = ballon_contour[:, 0, 0]
+        centroid_y = int(np.median(ys))
+        centroid_x = int(np.median(xs))
+    else:
+        m = cv2.moments(mask)
+        mask = 255 - mask
+        centroid_y = int(m['m01'] / m['m00'])
+        centroid_x = int(m['m10'] / m['m00'])
 
     # layout the central line, the center word is approximately aligned with the centroid of the mask
     num_words = len(words)
@@ -206,18 +213,28 @@ def layout_lines_aligncenter(
             new_len_l = central_line.length + len_left[-1] + delimiter_len
             new_x_l = centroid_x - new_len_l // 2
             new_r_l = new_x_l + new_len_l
-            if (new_x_l >= 0 and new_r_l <= bw):
-                candidate_mask = mask[pos_y:line_bottom, new_x_l:new_r_l]
-                if candidate_mask.sum() == 0:
+            if ballon_contour is not None:
+                rect_l = np.array([
+                    [new_x_l, pos_y],
+                    [new_r_l, pos_y],
+                    [new_r_l, line_bottom],
+                    [new_x_l, line_bottom]
+                ])
+                # Проверяем, что все углы прямоугольника внутри контура
+                if all(cv2.pointPolygonTest(ballon_contour, tuple(pt), False) >= 0 for pt in rect_l):
                     left_valid = True
-
         if sum_right > 0:
             new_len_r = central_line.length + len_right[0] + delimiter_len
             new_x_r = centroid_x - new_len_r // 2
             new_r_r = new_x_r + new_len_r
-            if (new_x_r >= 0 and new_r_r <= bw):
-                candidate_mask = mask[pos_y:line_bottom, new_x_r:new_r_r]
-                if candidate_mask.sum() == 0:
+            if ballon_contour is not None:
+                rect_r = np.array([
+                    [new_x_r, pos_y],
+                    [new_r_r, pos_y],
+                    [new_r_r, line_bottom],
+                    [new_x_r, line_bottom]
+                ])
+                if all(cv2.pointPolygonTest(ballon_contour, tuple(pt), False) >= 0 for pt in rect_r):
                     right_valid = True
 
         insert_left = False
@@ -348,7 +365,9 @@ def render_textblock_list_eng(
     ballonarea_thresh: float = 2,
     downscale_constraint: float = 0.7,
     original_img: np.ndarray = None,
-    disable_font_border: bool = False
+    disable_font_border: bool = False,
+    box_scale: float = 0.8,
+    min_font_size: int = 6
 ) -> np.ndarray:
 
     r"""
@@ -468,8 +487,12 @@ def render_textblock_list_eng(
         #     ry *= resize_ratio
         #     ballon_mask = cv2.resize(ballon_mask, (int(resize_ratio * ballon_mask.shape[1]), int(resize_ratio * ballon_mask.shape[0])))
 
-        # new region bbox
-        region_x, region_y, region_w, region_h = cv2.boundingRect(cv2.findNonZero(ballon_mask))
+        # new region bbox if mask
+        contours, _ = cv2.findContours(ballon_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            continue
+        ballon_contour = max(contours, key=cv2.contourArea)
+        region_x, region_y, region_w, region_h = cv2.boundingRect(ballon_contour)
 
         base_length_word = words[max(enumerate(word_lengths), key = lambda x: x[1])[0]]
         if len(base_length_word) == 0 :
@@ -516,12 +539,8 @@ def render_textblock_list_eng(
                         + (max(0, region_x - canvas_x1) + max(0, canvas_x2 - region_w - region_x)) * canvas_h * 255
 
         valid_lines_ratio = lines_area / np.sum(cv2.bitwise_and(lines_map, ballon_mask))
-        if valid_lines_ratio > 1:  # текст больше пузыря
-            scale_factor = 1 / np.sqrt(valid_lines_ratio)
-            font_size = max(int(font_size * scale_factor), 1)
-            font_size, sw, line_height, delimiter_len, base_length, word_lengths = calculate_font_values(font_size, words)
-            textlines = layout_lines_aligncenter(ballon_mask, words, word_lengths, delimiter_len, line_height, delimiter=delimiter)
-            textlines_image = render_lines(textlines, canvas_h, canvas_w, font_size, sw, line_spacing, region_font_color, region_stroke_color)
+        if valid_lines_ratio > 1: # text bbox > ballon area
+            resize_ratio = min(resize_ratio * valid_lines_ratio, (1 / downscale_constraint) ** 2)
 
         if rotated:
             rcx = rel_cx * region_angle_cos - rel_cy * region_angle_sin
